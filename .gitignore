@@ -54,4 +54,4 @@ dkms.conf
 # Other
 .cache.mk
 *.o.ur-safe
-
+.*.swp

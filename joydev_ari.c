@@ -37,6 +37,8 @@ MODULE_LICENSE("GPL");
 #define JOYDEV_MINORS		16
 #define JOYDEV_BUFFER_SIZE	64
 
+#define clamp_abs(value) (clamp(value, -32767, 32767))
+
 struct joydev {
 	int open;
 	struct input_handle handle;
@@ -48,15 +50,17 @@ struct joydev {
 	struct cdev cdev;
 	bool exist;
 
-	struct js_corr corr[ABS_CNT];
+	struct js_corr corr[ABS_CNT]; /* original axis index -> correction data */
 	struct JS_DATA_SAVE_TYPE glue;
 	int nabs;
 	int nkey;
 	__u16 keymap[KEY_MAX - BTN_MISC + 1];
 	__u16 keypam[KEY_MAX - BTN_MISC + 1];
-	__u8 absmap[ABS_CNT];
-	__u8 abspam[ABS_CNT];
-	__s16 abs[ABS_CNT];
+	__u8 absmap_orig[ABS_CNT]; /* axis driver code -> original axis index */
+	__u8 absmap_remap[ABS_CNT]; /* axis driver code -> remapped axis index */
+	__u8 abspam[ABS_CNT]; /* original axis index -> axis driver code */
+	__s16 abs_orig[ABS_CNT]; /* original axis index -> axis corrected value */
+	__s16 abs_remap[ABS_CNT]; /* remapped axis index -> aggregated axis corrected value */
 };
 
 struct joydev_client {
@@ -87,7 +91,7 @@ static int joydev_correct(int value, struct js_corr *corr)
 		return 0;
 	}
 
-	return clamp(value, -32767, 32767);
+	return clamp_abs(value);
 }
 
 static void joydev_pass_event(struct joydev_client *client,
@@ -120,6 +124,7 @@ static void joydev_event(struct input_handle *handle,
 	struct joydev *joydev = handle->private;
 	struct joydev_client *client;
 	struct js_event event;
+	int oi, oi2, ri, corr_value;
 
 	switch (type) {
 
@@ -133,12 +138,18 @@ static void joydev_event(struct input_handle *handle,
 
 	case EV_ABS:
 		event.type = JS_EVENT_AXIS;
-		event.number = joydev->absmap[code];
-		event.value = joydev_correct(value,
-					&joydev->corr[event.number]);
-		if (event.value == joydev->abs[event.number])
+		/* Add all contributions and clamp */
+		oi = joydev->absmap_orig[code];
+		ri = event.number = joydev->absmap_remap[code];
+		joydev->abs_orig[oi] = corr_value = joydev_correct(value, &joydev->corr[oi]);
+		for (oi2 = 0; oi2 < joydev->nabs; oi2++)
+			if (oi != oi2 && ri == joydev->absmap_remap[joydev->abspam[oi2]])
+				corr_value += joydev->abs_orig[oi2];
+		corr_value = clamp_abs(corr_value);
+		if (corr_value == joydev->abs_remap[ri])
 			return;
-		joydev->abs[event.number] = event.value;
+		event.value = corr_value;
+		joydev->abs_remap[event.number] = corr_value;
 		break;
 
 	default:
@@ -190,12 +201,21 @@ static void joydev_detach_client(struct joydev *joydev,
 static void joydev_refresh_state(struct joydev *joydev)
 {
 	struct input_dev *dev = joydev->handle.dev;
-	int i, val;
+	int i, oi, code, val;
+	int sum_remap[joydev->nabs];
 
 	for (i = 0; i < joydev->nabs; i++) {
-		val = input_abs_get_val(dev, joydev->abspam[i]);
-		joydev->abs[i] = joydev_correct(val, &joydev->corr[i]);
+		joydev->abs_remap[i] = 0;
+		sum_remap[i] = 0;
 	}
+	for (oi = 0; oi < joydev->nabs; oi++) {
+		code = joydev->abspam[oi];
+		val = joydev_correct(input_abs_get_val(dev, code), &joydev->corr[oi]);
+		joydev->abs_orig[oi] = val;
+		sum_remap[joydev->absmap_remap[code]] += val;
+	}
+	for (i = 0; i < joydev->nabs; i++)
+		joydev->abs_remap[i] = clamp_abs(sum_remap[i]);
 }
 
 static int joydev_open_device(struct joydev *joydev)
@@ -311,7 +331,7 @@ static int joydev_generate_startup_event(struct joydev_client *client,
 		} else {
 			event->type = JS_EVENT_AXIS | JS_EVENT_INIT;
 			event->number = client->startup - joydev->nkey;
-			event->value = joydev->abs[event->number];
+			event->value = joydev->abs_remap[event->number];
 		}
 		client->startup++;
 	}
@@ -358,8 +378,8 @@ static ssize_t joydev_0x_read(struct joydev_client *client,
 	for (data.buttons = i = 0; i < 32 && i < joydev->nkey; i++)
 		data.buttons |=
 			test_bit(joydev->keypam[i], input->key) ? (1 << i) : 0;
-	data.x = (joydev->abs[0] / 256 + 128) >> joydev->glue.JS_CORR.x;
-	data.y = (joydev->abs[1] / 256 + 128) >> joydev->glue.JS_CORR.y;
+	data.x = (joydev->abs_remap[0] / 256 + 128) >> joydev->glue.JS_CORR.x;
+	data.y = (joydev->abs_remap[1] / 256 + 128) >> joydev->glue.JS_CORR.y;
 
 	/*
 	 * Reset reader's event queue
@@ -450,7 +470,7 @@ static int joydev_handle_JSIOCSAXMAP(struct joydev *joydev,
 				     void __user *argp, size_t len)
 {
 	__u8 *abspam;
-	int i;
+	int i, code_orig, code_remap;
 	int retval = 0;
 
 	len = min(len, sizeof(joydev->abspam));
@@ -467,12 +487,15 @@ static int joydev_handle_JSIOCSAXMAP(struct joydev *joydev,
 		}
 	}
 
-	memcpy(joydev->abspam, abspam, len);
+//	memcpy(joydev->abspam, abspam, len);
 
-	for (i = 0; i < joydev->nabs; i++)
-		joydev->absmap[joydev->abspam[i]] = i;
+	for (i = 0; i < joydev->nabs; i++) {
+		code_orig = joydev->abspam[i];
+		code_remap = abspam[i];
+		joydev->absmap_remap[code_orig] = joydev->absmap_orig[code_remap];
+	}
 
- out:
+out:
 	kfree(abspam);
 	return retval;
 }
@@ -514,7 +537,6 @@ static int joydev_ioctl_common(struct joydev *joydev,
 {
 	struct input_dev *dev = joydev->handle.dev;
 	size_t len;
-	int i;
 	const char *name;
 
 	/* Process fixed-sized commands. */
@@ -547,11 +569,7 @@ static int joydev_ioctl_common(struct joydev *joydev,
 		if (copy_from_user(joydev->corr, argp,
 			      sizeof(joydev->corr[0]) * joydev->nabs))
 			return -EFAULT;
-
-		for (i = 0; i < joydev->nabs; i++) {
-			int val = input_abs_get_val(dev, joydev->abspam[i]);
-			joydev->abs[i] = joydev_correct(val, &joydev->corr[i]);
-		}
+		joydev_refresh_state(joydev);
 		return 0;
 
 	case JSIOCGCORR:
@@ -917,8 +935,11 @@ static int joydev_connect(struct input_handler *handler, struct input_dev *dev,
 	joydev->handle.handler = handler;
 	joydev->handle.private = joydev;
 
+	for (i = 0; i < ABS_CNT; i++)
+		joydev->absmap_remap[i] = ABS_MAX;
+
 	for_each_set_bit(i, dev->absbit, ABS_CNT) {
-		joydev->absmap[i] = joydev->nabs;
+		joydev->absmap_remap[i] = joydev->absmap_orig[i] = joydev->nabs;
 		joydev->abspam[joydev->nabs] = i;
 		joydev->nabs++;
 	}
